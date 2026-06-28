@@ -103,19 +103,19 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 	// the leaf write below is allowed. The kubepods.slice /
 	// kubepods-besteffort.slice already carry the node-wide RT budget (e.g.
 	// 950000/1000000) and must NOT be overwritten; only the per-pod slice is
-	// created at 0/0 and needs a reservation. A seeded parent gets a generous
-	// scalar (95% of the period) which the kernel applies to all cores, leaving
-	// ample headroom above the leaf's per-core list. Parent writes are
-	// best-effort so a pre-seeded or capped parent never fails this pod.
+	// created at 0/0 and needs a reservation. The pod slice is seeded with the
+	// SAME per-core list as the leaf (its own cpuset cores only) rather than a
+	// scalar: a scalar reserves budget on every core, so a second RT pod pinned
+	// to other cores would exceed the parent's bandwidth and fail to seed. A
+	// per-core reservation lets pods on disjoint cores coexist. Parent writes
+	// are best-effort so a pre-seeded or capped parent never fails this pod.
 	if r.CpuRtRuntime != 0 && r.CpuRtPeriod != 0 {
-		parentPeriod := period
-		parentRuntime := strconv.FormatUint(r.CpuRtPeriod/100*95, 10)
 		pod := filepath.Dir(dirPath)
 		besteffort := filepath.Dir(pod)
 		kubepods := filepath.Dir(besteffort)
 		for _, parent := range []string{kubepods, besteffort, pod} {
 			if rtRuntimeIsZero(parent) {
-				_ = writeRtPair(parent, parentRuntime, parentPeriod)
+				_ = writeRtPair(parent, runtime, period)
 			}
 		}
 	}
