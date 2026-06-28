@@ -65,9 +65,17 @@ func setCpu(dirPath string, r *configs.Resources) error {
 // scope it seeds the ancestor slices (kubepods.slice ->
 // kubepods-besteffort.slice -> the pod slice) top-down, because the kernel
 // requires every parent to already hold an RT budget >= the child's on each
-// core. The parents get a generous scalar reservation (the kernel applies a
-// scalar to all cores), which avoids the per-core zeroing that a per-core list
-// would impose on sibling RT pods; the leaf gets the exact per-core list.
+// core. The parents are seeded with the SAME per-core list as the leaf (only
+// this pod's cpuset cores), not a scalar: a scalar would reserve budget on
+// every core and a second RT pod pinned to other cores would then exceed the
+// parent's bandwidth and fail to seed. A per-core reservation lets pods on
+// disjoint cores coexist; the leaf gets the exact per-core list too.
+//
+// Before writing the leaf, runc also reclaims any RT reservation that a sibling
+// scope under the same pod slice is holding without actually running real-time
+// tasks (the pod's pause/sandbox scope). See reclaimSandboxRtBudget for why
+// this is required to avoid an intermittent EINVAL crash-loop on the second RT
+// pod.
 func setRtSched(dirPath string, r *configs.Resources) error {
 	if r.CpuRtPeriod == 0 && r.CpuRtRuntime == 0 {
 		return nil
@@ -118,10 +126,115 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 				_ = writeRtPair(parent, runtime, period)
 			}
 		}
+
+		// Reclaim any RT reservation held by a sibling scope (the pod's
+		// pause/sandbox) that is not running real-time tasks, so this
+		// container's leaf write below stays within the pod-slice budget.
+		reclaimSandboxRtBudget(dirPath)
 	}
 
 	// Leaf: write the exact per-core reservation for this container.
 	return writeRtPair(dirPath, runtime, period)
+}
+
+// reclaimSandboxRtBudget zeros cpu.rt_runtime_us on any sibling scope of
+// dirPath that holds an RT reservation but is not actually running real-time
+// tasks.
+//
+// On a cgroup v2 H-CBS hierarchy the kernel enforces, per CPU,
+// Sum(children rt_runtime) <= parent rt_runtime. containerd creates a pod's
+// pause (sandbox) scope as a sibling of the workload container scope under the
+// same per-pod slice. Intermittently the sandbox scope ends up holding the
+// pod's entire RT reservation even though the OCI sandbox spec carries no
+// realtimeRuntime and the pause process never runs as a real-time task. When
+// that happens, the workload container's leaf write would push the per-CPU sum
+// over the pod-slice budget and fail with EINVAL, crash-looping the pod
+// (typically the second RT pod admitted to a node) until the stale cgroup
+// state is cleared by deleting and recreating the pod.
+//
+// An RT reservation owned by a cgroup whose tasks are all SCHED_NORMAL is
+// unused, so it is safe to reclaim before seeding this container. Sibling
+// scopes that actually run real-time tasks (e.g. another RT workload container
+// in a multi-container pod) are detected via their scheduling policy and left
+// untouched. The reclaim is best-effort: any read/write error is ignored so a
+// transient failure never blocks container creation.
+func reclaimSandboxRtBudget(dirPath string) {
+	pod := filepath.Dir(dirPath)
+	entries, err := os.ReadDir(pod)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sibling := filepath.Join(pod, e.Name())
+		if sibling == dirPath {
+			continue
+		}
+		if rtRuntimeIsZero(sibling) {
+			continue // no RT budget to reclaim
+		}
+		if cgroupHasRtTask(sibling) {
+			continue // genuine RT workload sibling: leave it alone
+		}
+		// Unused RT reservation held by a non-RT sibling (the sandbox):
+		// reclaim it so this container's leaf has bandwidth.
+		_ = cgroups.WriteFile(sibling, "cpu.rt_runtime_us", "0")
+	}
+}
+
+// cgroupHasRtTask reports whether any task in dir's cgroup.procs is scheduled
+// with a real-time policy (SCHED_FIFO, SCHED_RR or SCHED_DEADLINE). A cgroup
+// with no tasks, or only SCHED_NORMAL/SCHED_BATCH/SCHED_IDLE tasks, is treated
+// as not running real-time work.
+func cgroupHasRtTask(dir string) bool {
+	data, err := cgroups.ReadFile(dir, "cgroup.procs")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(data, "\n") {
+		pid := strings.TrimSpace(line)
+		if pid == "" {
+			continue
+		}
+		if pidIsRealtime(pid) {
+			return true
+		}
+	}
+	return false
+}
+
+// pidIsRealtime reports whether the process pid is scheduled with a real-time
+// policy. It reads field 41 (policy) of /proc/<pid>/stat. The comm field
+// (field 2) is enclosed in parentheses and may itself contain spaces or
+// parentheses, so parsing resumes after the final ')': the first field after
+// it is field 3 (state), making policy index 41-3 = 38.
+func pidIsRealtime(pid string) bool {
+	data, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+1 >= len(s) {
+		return false
+	}
+	fields := strings.Fields(s[i+1:])
+	const policyIdx = 38 // field 41 minus the 3 leading fields consumed above
+	if len(fields) <= policyIdx {
+		return false
+	}
+	policy, err := strconv.Atoi(fields[policyIdx])
+	if err != nil {
+		return false
+	}
+	switch policy {
+	case 1, 2, 6: // SCHED_FIFO, SCHED_RR, SCHED_DEADLINE
+		return true
+	default: // SCHED_NORMAL(0), SCHED_BATCH(3), SCHED_IDLE(5)
+		return false
+	}
 }
 
 // rtRuntimeIsZero reports whether dir's cpu.rt_runtime_us currently reads "0",
