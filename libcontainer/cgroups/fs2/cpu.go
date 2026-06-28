@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -61,21 +62,16 @@ func setCpu(dirPath string, r *configs.Resources) error {
 // handles these files on cgroup v1, so without this the realtimeRuntime /
 // realtimePeriod from the OCI spec are silently dropped on a v2 node.
 //
-// runc owns the full RT cgroup chain: before writing this container's leaf
-// scope it seeds the ancestor slices (kubepods.slice ->
-// kubepods-besteffort.slice -> the pod slice) top-down, because the kernel
-// requires every parent to already hold an RT budget >= the child's on each
-// core. The parents are seeded with the SAME per-core list as the leaf (only
-// this pod's cpuset cores), not a scalar: a scalar would reserve budget on
-// every core and a second RT pod pinned to other cores would then exceed the
-// parent's bandwidth and fail to seed. A per-core reservation lets pods on
-// disjoint cores coexist; the leaf gets the exact per-core list too.
-//
-// Before writing the leaf, runc also reclaims any RT reservation that a sibling
-// scope under the same pod slice is holding without actually running real-time
-// tasks (the pod's pause/sandbox scope). See reclaimSandboxRtBudget for why
-// this is required to avoid an intermittent EINVAL crash-loop on the second RT
-// pod.
+// runc owns the full RT cgroup chain. Before writing this container's leaf
+// scope it (1) seeds the node-wide ancestor slices (kubepods.slice ->
+// kubepods-besteffort.slice) if they hold no RT budget yet, (2) reclaims any RT
+// budget spuriously held by the pod's pause/sandbox scope, and (3) raises the
+// per-pod slice to the SUM of every workload container's reservation. The
+// kernel enforces, per CPU, Sum(children rt_runtime) <= parent rt_runtime, so
+// every parent must already hold at least the children's combined budget. A
+// per-core list (not a scalar) is used throughout so pods/containers pinned to
+// disjoint cores never steal each other's bandwidth, and so that all containers
+// of one pod fit under the pod slice simultaneously.
 func setRtSched(dirPath string, r *configs.Resources) error {
 	if r.CpuRtPeriod == 0 && r.CpuRtRuntime == 0 {
 		return nil
@@ -86,8 +82,10 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		period = strconv.FormatUint(r.CpuRtPeriod, 10)
 	}
 
-	// Build the leaf's per-core runtime list "<runtime> <cpu> <runtime> <cpu> ...".
+	// Build the leaf's per-core runtime list "<runtime> <cpu> <runtime> <cpu>
+	// ..." and a cpu->runtime map used to size the pod slice.
 	runtime := ""
+	leafRt := map[int]int64{}
 	if r.CpuRtRuntime != 0 {
 		rt := strconv.FormatInt(r.CpuRtRuntime, 10)
 		var b strings.Builder
@@ -98,6 +96,7 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 			b.WriteString(rt)
 			b.WriteByte(' ')
 			b.WriteString(strconv.Itoa(cpu))
+			leafRt[cpu] = r.CpuRtRuntime
 		}
 		if b.Len() == 0 {
 			// No cpuset was provided: fall back to a scalar runtime.
@@ -107,57 +106,56 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		}
 	}
 
-	// Seed only the ancestor slices that still have no RT budget, top-down, so
-	// the leaf write below is allowed. The kubepods.slice /
-	// kubepods-besteffort.slice already carry the node-wide RT budget (e.g.
-	// 950000/1000000) and must NOT be overwritten; only the per-pod slice is
-	// created at 0/0 and needs a reservation. The pod slice is seeded with the
-	// SAME per-core list as the leaf (its own cpuset cores only) rather than a
-	// scalar: a scalar reserves budget on every core, so a second RT pod pinned
-	// to other cores would exceed the parent's bandwidth and fail to seed. A
-	// per-core reservation lets pods on disjoint cores coexist. Parent writes
-	// are best-effort so a pre-seeded or capped parent never fails this pod.
 	if r.CpuRtRuntime != 0 && r.CpuRtPeriod != 0 {
 		pod := filepath.Dir(dirPath)
 		besteffort := filepath.Dir(pod)
 		kubepods := filepath.Dir(besteffort)
-		for _, parent := range []string{kubepods, besteffort, pod} {
+
+		// Seed only the node-wide ancestor slices that still have no RT budget.
+		// kubepods.slice / kubepods-besteffort.slice normally already carry the
+		// node RT budget (e.g. 950000/1000000) and must not be overwritten; the
+		// per-pod slice is sized separately below.
+		for _, parent := range []string{kubepods, besteffort} {
 			if rtRuntimeIsZero(parent) {
 				_ = writeRtPair(parent, runtime, period)
 			}
 		}
 
-		// Reclaim any RT reservation held by a sibling scope (the pod's
-		// pause/sandbox) that is not running real-time tasks, so this
-		// container's leaf write below stays within the pod-slice budget.
+		// Reclaim RT budget spuriously held by the pod's pause/sandbox scope so
+		// it does not count against the pod-slice budget.
 		reclaimSandboxRtBudget(dirPath)
+
+		// Size the per-pod slice to the SUM of all its workload containers'
+		// reservations (existing sibling scopes + this leaf), per core, so that
+		// every container in the pod fits under the parent budget at once. This
+		// is raised before the leaf is written, so Sum(children) <= parent holds
+		// throughout. Best-effort: a capped/pre-seeded parent never blocks here.
+		if list := rtPairsList(podSliceBudget(pod, dirPath, leafRt)); list != "" {
+			_ = writeRtPair(pod, list, period)
+		}
 	}
 
 	// Leaf: write the exact per-core reservation for this container.
 	return writeRtPair(dirPath, runtime, period)
 }
 
-// reclaimSandboxRtBudget zeros cpu.rt_runtime_us on any sibling scope of
-// dirPath that holds an RT reservation but is not actually running real-time
-// tasks.
+// reclaimSandboxRtBudget zeros cpu.rt_runtime_us on the pod's pause/sandbox
+// scope when it spuriously holds an RT reservation.
 //
 // On a cgroup v2 H-CBS hierarchy the kernel enforces, per CPU,
 // Sum(children rt_runtime) <= parent rt_runtime. containerd creates a pod's
 // pause (sandbox) scope as a sibling of the workload container scope under the
-// same per-pod slice. Intermittently the sandbox scope ends up holding the
-// pod's entire RT reservation even though the OCI sandbox spec carries no
-// realtimeRuntime and the pause process never runs as a real-time task. When
-// that happens, the workload container's leaf write would push the per-CPU sum
-// over the pod-slice budget and fail with EINVAL, crash-looping the pod
-// (typically the second RT pod admitted to a node) until the stale cgroup
-// state is cleared by deleting and recreating the pod.
+// same per-pod slice. Intermittently the sandbox scope ends up holding RT
+// budget even though its OCI spec carries no realtimeRuntime and the pause
+// process never runs as a real-time task; that budget would then count against
+// the pod-slice and push a workload container's leaf write over the limit,
+// failing with EINVAL and crash-looping the pod.
 //
-// An RT reservation owned by a cgroup whose tasks are all SCHED_NORMAL is
-// unused, so it is safe to reclaim before seeding this container. Sibling
-// scopes that actually run real-time tasks (e.g. another RT workload container
-// in a multi-container pod) are detected via their scheduling policy and left
-// untouched. The reclaim is best-effort: any read/write error is ignored so a
-// transient failure never blocks container creation.
+// Only the sandbox is reclaimed: it is identified by its "pause" process (see
+// isPauseSandbox), so a workload container - even an idle one whose entrypoint
+// is merely sleeping (SCHED_NORMAL) - is never stripped of its reservation.
+// Best-effort: read/write errors are ignored so a transient failure never
+// blocks container creation.
 func reclaimSandboxRtBudget(dirPath string) {
 	pod := filepath.Dir(dirPath)
 	entries, err := os.ReadDir(pod)
@@ -175,20 +173,18 @@ func reclaimSandboxRtBudget(dirPath string) {
 		if rtRuntimeIsZero(sibling) {
 			continue // no RT budget to reclaim
 		}
-		if cgroupHasRtTask(sibling) {
-			continue // genuine RT workload sibling: leave it alone
+		if !isPauseSandbox(sibling) {
+			continue // a workload container: keep its reservation
 		}
-		// Unused RT reservation held by a non-RT sibling (the sandbox):
-		// reclaim it so this container's leaf has bandwidth.
 		_ = cgroups.WriteFile(sibling, "cpu.rt_runtime_us", "0")
 	}
 }
 
-// cgroupHasRtTask reports whether any task in dir's cgroup.procs is scheduled
-// with a real-time policy (SCHED_FIFO, SCHED_RR or SCHED_DEADLINE). A cgroup
-// with no tasks, or only SCHED_NORMAL/SCHED_BATCH/SCHED_IDLE tasks, is treated
-// as not running real-time work.
-func cgroupHasRtTask(dir string) bool {
+// isPauseSandbox reports whether dir is a pod's pause/sandbox scope, identified
+// by a task whose process name (/proc/<pid>/comm) is "pause". The sandbox holds
+// no RT spec, so any RT budget it carries is spurious; a workload container is
+// never matched, so its reservation is preserved.
+func isPauseSandbox(dir string) bool {
 	data, err := cgroups.ReadFile(dir, "cgroup.procs")
 	if err != nil {
 		return false
@@ -198,43 +194,88 @@ func cgroupHasRtTask(dir string) bool {
 		if pid == "" {
 			continue
 		}
-		if pidIsRealtime(pid) {
+		comm, err := os.ReadFile("/proc/" + pid + "/comm")
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) == "pause" {
 			return true
 		}
 	}
 	return false
 }
 
-// pidIsRealtime reports whether the process pid is scheduled with a real-time
-// policy. It reads field 41 (policy) of /proc/<pid>/stat. The comm field
-// (field 2) is enclosed in parentheses and may itself contain spaces or
-// parentheses, so parsing resumes after the final ')': the first field after
-// it is field 3 (state), making policy index 41-3 = 38.
-func pidIsRealtime(pid string) bool {
-	data, err := os.ReadFile("/proc/" + pid + "/stat")
+// podSliceBudget computes the per-core RT runtime the pod slice must hold: the
+// sum of every workload container scope already present under pod (excluding
+// this leaf and the pause sandbox) plus this leaf's own reservation. The result
+// is keyed by CPU id.
+func podSliceBudget(pod, leaf string, leafRt map[int]int64) map[int]int64 {
+	budget := map[int]int64{}
+	for cpu, v := range leafRt {
+		budget[cpu] += v
+	}
+	entries, err := os.ReadDir(pod)
 	if err != nil {
-		return false
+		return budget
 	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 || i+1 >= len(s) {
-		return false
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sib := filepath.Join(pod, e.Name())
+		if sib == leaf || isPauseSandbox(sib) {
+			continue
+		}
+		for cpu, v := range readRtPerCore(sib) {
+			budget[cpu] += v
+		}
 	}
-	fields := strings.Fields(s[i+1:])
-	const policyIdx = 38 // field 41 minus the 3 leading fields consumed above
-	if len(fields) <= policyIdx {
-		return false
-	}
-	policy, err := strconv.Atoi(fields[policyIdx])
+	return budget
+}
+
+// readRtPerCore parses a cpu.rt_runtime_us READ value - a positional per-cpu
+// array such as "100 0 0 100" where the index is the CPU id - into a
+// cpu->runtime map, dropping zero entries. A single scalar value maps to cpu 0.
+func readRtPerCore(dir string) map[int]int64 {
+	out := map[int]int64{}
+	data, err := cgroups.ReadFile(dir, "cpu.rt_runtime_us")
 	if err != nil {
-		return false
+		return out
 	}
-	switch policy {
-	case 1, 2, 6: // SCHED_FIFO, SCHED_RR, SCHED_DEADLINE
-		return true
-	default: // SCHED_NORMAL(0), SCHED_BATCH(3), SCHED_IDLE(5)
-		return false
+	for cpu, f := range strings.Fields(strings.TrimSpace(data)) {
+		v, err := strconv.ParseInt(f, 10, 64)
+		if err != nil || v == 0 {
+			continue
+		}
+		out[cpu] = v
 	}
+	return out
+}
+
+// rtPairsList turns a cpu->runtime map into the kernel write format
+// "<runtime> <cpu> <runtime> <cpu> ...", sorted by CPU id for determinism.
+func rtPairsList(perCore map[int]int64) string {
+	if len(perCore) == 0 {
+		return ""
+	}
+	cpus := make([]int, 0, len(perCore))
+	for c := range perCore {
+		cpus = append(cpus, c)
+	}
+	sort.Ints(cpus)
+	var b strings.Builder
+	for _, c := range cpus {
+		if perCore[c] == 0 {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.FormatInt(perCore[c], 10))
+		b.WriteByte(' ')
+		b.WriteString(strconv.Itoa(c))
+	}
+	return b.String()
 }
 
 // rtRuntimeIsZero reports whether dir's cpu.rt_runtime_us currently reads "0",
