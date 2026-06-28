@@ -2,15 +2,14 @@ package fs2
 
 import (
 	"bufio"
-	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
 	"github.com/opencontainers/runc/libcontainer/configs"
-	"golang.org/x/sys/unix"
 )
 
 func isCpuSet(r *configs.Resources) bool {
@@ -62,9 +61,13 @@ func setCpu(dirPath string, r *configs.Resources) error {
 // handles these files on cgroup v1, so without this the realtimeRuntime /
 // realtimePeriod from the OCI spec are silently dropped on a v2 node.
 //
-// The parent slices (kubepods.slice etc.) must already have an RT budget for
-// the write below to succeed; on this setup the DRA driver seeds those parents
-// before the container is created.
+// runc owns the full RT cgroup chain: before writing this container's leaf
+// scope it seeds the ancestor slices (kubepods.slice ->
+// kubepods-besteffort.slice -> the pod slice) top-down, because the kernel
+// requires every parent to already hold an RT budget >= the child's on each
+// core. The parents get a generous scalar reservation (the kernel applies a
+// scalar to all cores), which avoids the per-core zeroing that a per-core list
+// would impose on sibling RT pods; the leaf gets the exact per-core list.
 func setRtSched(dirPath string, r *configs.Resources) error {
 	if r.CpuRtPeriod == 0 && r.CpuRtRuntime == 0 {
 		return nil
@@ -75,7 +78,7 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		period = strconv.FormatUint(r.CpuRtPeriod, 10)
 	}
 
-	// Build the per-core runtime list "<runtime> <cpu> <runtime> <cpu> ...".
+	// Build the leaf's per-core runtime list "<runtime> <cpu> <runtime> <cpu> ...".
 	runtime := ""
 	if r.CpuRtRuntime != 0 {
 		rt := strconv.FormatInt(r.CpuRtRuntime, 10)
@@ -96,27 +99,61 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		}
 	}
 
-	// Write order matters: the first cpu.rt_runtime_us write can fail with
-	// EINVAL while cpu.rt_period_us is still 0, so we try runtime, then period,
-	// then runtime again, tolerating the initial EINVAL.
-	if runtime != "" {
-		if err := cgroups.WriteFile(dirPath, "cpu.rt_runtime_us", runtime); err != nil {
-			if !errors.Is(err, unix.EINVAL) || period == "" {
-				return err
+	// Seed only the ancestor slices that still have no RT budget, top-down, so
+	// the leaf write below is allowed. The kubepods.slice /
+	// kubepods-besteffort.slice already carry the node-wide RT budget (e.g.
+	// 950000/1000000) and must NOT be overwritten; only the per-pod slice is
+	// created at 0/0 and needs a reservation. A seeded parent gets a generous
+	// scalar (95% of the period) which the kernel applies to all cores, leaving
+	// ample headroom above the leaf's per-core list. Parent writes are
+	// best-effort so a pre-seeded or capped parent never fails this pod.
+	if r.CpuRtRuntime != 0 && r.CpuRtPeriod != 0 {
+		parentPeriod := period
+		parentRuntime := strconv.FormatUint(r.CpuRtPeriod/100*95, 10)
+		pod := filepath.Dir(dirPath)
+		besteffort := filepath.Dir(pod)
+		kubepods := filepath.Dir(besteffort)
+		for _, parent := range []string{kubepods, besteffort, pod} {
+			if rtRuntimeIsZero(parent) {
+				_ = writeRtPair(parent, parentRuntime, parentPeriod)
 			}
 		}
 	}
+
+	// Leaf: write the exact per-core reservation for this container.
+	return writeRtPair(dirPath, runtime, period)
+}
+
+// rtRuntimeIsZero reports whether dir's cpu.rt_runtime_us currently reads "0",
+// i.e. the slice holds no RT budget yet and is safe to seed. If the file is
+// missing or unreadable it returns false so an already-provisioned ancestor
+// (e.g. kubepods.slice) is left untouched.
+func rtRuntimeIsZero(dir string) bool {
+	data, err := cgroups.ReadFile(dir, "cpu.rt_runtime_us")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(data) == "0"
+}
+
+// writeRtPair writes cpu.rt_period_us and cpu.rt_runtime_us to dir. Order
+// matters: a fresh cgroup defaults to period=0, and writing a non-zero
+// cpu.rt_runtime_us while the period is 0 fails with EINVAL (runtime/period is
+// undefined). So the period is always written first, then the runtime.
+func writeRtPair(dir, runtime, period string) error {
+	if runtime == "" && period == "" {
+		return nil
+	}
 	if period != "" {
-		if err := cgroups.WriteFile(dirPath, "cpu.rt_period_us", period); err != nil {
+		if err := cgroups.WriteFile(dir, "cpu.rt_period_us", period); err != nil {
 			return err
 		}
 	}
 	if runtime != "" {
-		if err := cgroups.WriteFile(dirPath, "cpu.rt_runtime_us", runtime); err != nil {
+		if err := cgroups.WriteFile(dir, "cpu.rt_runtime_us", runtime); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
