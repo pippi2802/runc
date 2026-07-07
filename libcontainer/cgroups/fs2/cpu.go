@@ -111,26 +111,27 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		besteffort := filepath.Dir(pod)
 		kubepods := filepath.Dir(besteffort)
 
-		// Seed only the node-wide ancestor slices that still have no RT budget.
-		// kubepods.slice / kubepods-besteffort.slice normally already carry the
-		// node RT budget (e.g. 950000/1000000) and must not be overwritten; the
-		// per-pod slice is sized separately below.
-		for _, parent := range []string{kubepods, besteffort} {
-			if rtRuntimeIsZero(parent) {
-				_ = writeRtPair(parent, runtime, period)
-			}
-		}
-
 		// Reclaim RT budget spuriously held by the pod's pause/sandbox scope so
 		// it does not count against the pod-slice budget.
 		reclaimSandboxRtBudget(dirPath)
 
-		// Size the per-pod slice to the SUM of all its workload containers'
-		// reservations (existing sibling scopes + this leaf), per core, so that
-		// every container in the pod fits under the parent budget at once. This
-		// is raised before the leaf is written, so Sum(children) <= parent holds
-		// throughout. Best-effort: a capped/pre-seeded parent never blocks here.
-		if list := rtPairsList(podSliceBudget(pod, dirPath, leafRt)); list != "" {
+		// Compute the per-core RT budget every ancestor slice must hold, bottom
+		// up and in memory, accounting for this new leaf. The kernel enforces,
+		// per CPU, Sum(children rt_runtime) <= parent rt_runtime, and it does so
+		// PER CORE: seeding an ancestor on cpu A does not give a later pod pinned
+		// to cpu B any budget on B. So each ancestor is raised to the SUM of its
+		// children's per-core reservations (with this leaf/pod substituted in),
+		// not seeded all-or-nothing. kubepods.slice keeps its existing values as
+		// a floor so the pre-provisioned node RT cap is never lowered.
+		podBudget := podSliceBudget(pod, dirPath, leafRt)
+		besteffortBudget := childrenSum(besteffort, pod, podBudget, false)
+		kubepodsBudget := childrenSum(kubepods, besteffort, besteffortBudget, true)
+
+		// Write top down so Sum(children) <= parent holds at every step. Best
+		// effort: a capped/pre-seeded parent never blocks container creation.
+		_ = writeRtPair(kubepods, rtPairsList(kubepodsBudget), period)
+		_ = writeRtPair(besteffort, rtPairsList(besteffortBudget), period)
+		if list := rtPairsList(podBudget); list != "" {
 			_ = writeRtPair(pod, list, period)
 		}
 	}
@@ -203,6 +204,43 @@ func isPauseSandbox(dir string) bool {
 		}
 	}
 	return false
+}
+
+// childrenSum returns the per-core RT runtime a slice must hold: the sum over
+// its immediate child cgroups of their reservations, substituting override for
+// the child at overrideDir (whose new value has not been written yet). When
+// preserveFloor is true the slice's current per-core values are kept as a lower
+// bound, so a pre-provisioned node cap (e.g. kubepods.slice) is never lowered.
+func childrenSum(parent, overrideDir string, override map[int]int64, preserveFloor bool) map[int]int64 {
+	budget := map[int]int64{}
+	if preserveFloor {
+		for cpu, v := range readRtPerCore(parent) {
+			budget[cpu] = v
+		}
+	}
+	sum := map[int]int64{}
+	entries, err := os.ReadDir(parent)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			c := filepath.Join(parent, e.Name())
+			per := readRtPerCore(c)
+			if c == overrideDir {
+				per = override
+			}
+			for cpu, v := range per {
+				sum[cpu] += v
+			}
+		}
+	}
+	for cpu, v := range sum {
+		if v > budget[cpu] {
+			budget[cpu] = v
+		}
+	}
+	return budget
 }
 
 // podSliceBudget computes the per-core RT runtime the pod slice must hold: the
