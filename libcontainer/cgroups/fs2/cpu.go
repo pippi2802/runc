@@ -121,10 +121,18 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		// PER CORE: seeding an ancestor on cpu A does not give a later pod pinned
 		// to cpu B any budget on B. So each ancestor is raised to the SUM of its
 		// children's per-core reservations (with this leaf/pod substituted in),
-		// not seeded all-or-nothing. kubepods.slice keeps its existing values as
-		// a floor so the pre-provisioned node RT cap is never lowered.
+		// not seeded all-or-nothing.
+		//
+		// Both node-cap slices (kubepods.slice and kubepods-besteffort.slice)
+		// keep their existing per-core values as a FLOOR (preserveFloor=true), so
+		// the pre-provisioned node RT cap (e.g. 950000 on every core) is never
+		// lowered or zeroed. This matters most for besteffort: it is SHARED by
+		// every pod, so when two pods start concurrently on disjoint cores each
+		// runc would otherwise rewrite besteffort with only its own cores and
+		// zero the other pod's cores, making the loser's leaf write EINVAL.
+		// Preserving the floor keeps all cores funded, so both leaves fit.
 		podBudget := podSliceBudget(pod, dirPath, leafRt)
-		besteffortBudget := childrenSum(besteffort, pod, podBudget, false)
+		besteffortBudget := childrenSum(besteffort, pod, podBudget, true)
 		kubepodsBudget := childrenSum(kubepods, besteffort, besteffortBudget, true)
 
 		// Write top down so Sum(children) <= parent holds at every step. Best
