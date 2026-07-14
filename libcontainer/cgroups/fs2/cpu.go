@@ -135,8 +135,18 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		besteffortBudget := childrenSum(besteffort, pod, podBudget, true)
 		kubepodsBudget := childrenSum(kubepods, besteffort, besteffortBudget, true)
 
+		// Also seed the cgroup-v2 ROOT so runc alone establishes the whole chain
+		// root -> kubepods -> besteffort -> pod -> leaf, with no external node
+		// seed script. The root RT file is only writable while the global RT
+		// admission control is OFF (kernel.sched_rt_runtime_us = -1, set once at
+		// boot via sysctl); under a finite global it returns EBUSY and this write
+		// is silently skipped (best-effort). preserveFloor keeps any node cap.
+		root := filepath.Dir(kubepods)
+		rootBudget := childrenSum(root, kubepods, kubepodsBudget, true)
+
 		// Write top down so Sum(children) <= parent holds at every step. Best
 		// effort: a capped/pre-seeded parent never blocks container creation.
+		_ = writeRtPair(root, rtPairsList(rootBudget), period)
 		_ = writeRtPair(kubepods, rtPairsList(kubepodsBudget), period)
 		_ = writeRtPair(besteffort, rtPairsList(besteffortBudget), period)
 		if list := rtPairsList(podBudget); list != "" {
