@@ -80,6 +80,16 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 	period := ""
 	if r.CpuRtPeriod != 0 {
 		period = strconv.FormatUint(r.CpuRtPeriod, 10)
+	} else if r.CpuRtRuntime != 0 {
+		// The OCI spec set realtimeRuntime but omitted realtimePeriod. A fresh
+		// cgroup has period 0, and the kernel rejects a non-zero runtime while
+		// the period is 0 (runtime > period) with EINVAL; it also requires every
+		// non-zero period in the chain to be identical. Default the period to the
+		// node-wide global (kernel.sched_rt_period_us) so the leaf and every
+		// ancestor we seed share one consistent period.
+		if gp := globalRtPeriod(); gp != 0 {
+			period = strconv.FormatUint(gp, 10)
+		}
 	}
 
 	// Build the leaf's per-core runtime list "<runtime> <cpu> <runtime> <cpu>
@@ -106,51 +116,63 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 		}
 	}
 
-	if r.CpuRtRuntime != 0 && r.CpuRtPeriod != 0 {
-		pod := filepath.Dir(dirPath)
-		besteffort := filepath.Dir(pod)
-		kubepods := filepath.Dir(besteffort)
-
+	if r.CpuRtRuntime != 0 {
 		// Reclaim RT budget spuriously held by the pod's pause/sandbox scope so
 		// it does not count against the pod-slice budget.
 		reclaimSandboxRtBudget(dirPath)
 
-		// Compute the per-core RT budget every ancestor slice must hold, bottom
-		// up and in memory, accounting for this new leaf. The kernel enforces,
-		// per CPU, Sum(children rt_runtime) <= parent rt_runtime, and it does so
-		// PER CORE: seeding an ancestor on cpu A does not give a later pod pinned
-		// to cpu B any budget on B. So each ancestor is raised to the SUM of its
-		// children's per-core reservations (with this leaf/pod substituted in),
-		// not seeded all-or-nothing.
-		//
-		// Both node-cap slices (kubepods.slice and kubepods-besteffort.slice)
-		// keep their existing per-core values as a FLOOR (preserveFloor=true), so
-		// the pre-provisioned node RT cap (e.g. 950000 on every core) is never
-		// lowered or zeroed. This matters most for besteffort: it is SHARED by
-		// every pod, so when two pods start concurrently on disjoint cores each
-		// runc would otherwise rewrite besteffort with only its own cores and
-		// zero the other pod's cores, making the loser's leaf write EINVAL.
-		// Preserving the floor keeps all cores funded, so both leaves fit.
-		podBudget := podSliceBudget(pod, dirPath, leafRt)
-		besteffortBudget := childrenSum(besteffort, pod, podBudget, true)
-		kubepodsBudget := childrenSum(kubepods, besteffort, besteffortBudget, true)
+		// Build the ancestor chain from the pod slice up to (but excluding) the
+		// cgroup-v2 root: chain[0] is the pod slice and chain[len-1] is
+		// kubepods.slice. The depth is NOT fixed - it depends on the pod's QoS
+		// class:
+		//   BestEffort: leaf -> pod -> kubepods-besteffort.slice -> kubepods.slice
+		//   Burstable:  leaf -> pod -> kubepods-burstable.slice  -> kubepods.slice
+		//   Guaranteed: leaf -> pod ->                              kubepods.slice
+		// Walking up by parent directory until the root handles every QoS class
+		// generically, instead of assuming a fixed besteffort depth.
+		var chain []string
+		for dir := filepath.Dir(dirPath); dir != UnifiedMountpoint && dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
+			chain = append(chain, dir)
+		}
 
-		// Also seed the cgroup-v2 ROOT so runc alone establishes the whole chain
-		// root -> kubepods -> besteffort -> pod -> leaf, with no external node
-		// seed script. The root RT file is only writable while the global RT
-		// admission control is OFF (kernel.sched_rt_runtime_us = -1, set once at
-		// boot via sysctl); under a finite global it returns EBUSY and this write
-		// is silently skipped (best-effort). preserveFloor keeps any node cap.
-		root := filepath.Dir(kubepods)
-		rootBudget := childrenSum(root, kubepods, kubepodsBudget, true)
+		if len(chain) > 0 {
+			// Compute the per-core RT budget every ancestor must hold, bottom up
+			// and in memory, accounting for this new leaf. The kernel enforces,
+			// per CPU, Sum(children rt_runtime) <= parent rt_runtime. So each
+			// ancestor is raised to the SUM of its children's per-core
+			// reservations (with this pod substituted in), not seeded
+			// all-or-nothing.
+			//
+			// Every ancestor keeps its existing per-core values as a FLOOR
+			// (preserveFloor=true), so the pre-provisioned node RT cap seeded once
+			// at boot on kubepods.slice is never lowered or zeroed, and two pods
+			// starting concurrently on disjoint cores never wipe each other's
+			// budget (each would otherwise rewrite a shared QoS slice with only
+			// its own cores). Preserving the floor keeps all cores funded.
+			budgets := make([]map[int]int64, len(chain))
+			budgets[0] = podSliceBudget(chain[0], dirPath, leafRt)
+			for i := 1; i < len(chain); i++ {
+				budgets[i] = childrenSum(chain[i], chain[i-1], budgets[i-1], true)
+			}
 
-		// Write top down so Sum(children) <= parent holds at every step. Best
-		// effort: a capped/pre-seeded parent never blocks container creation.
-		_ = writeRtPair(root, rtPairsList(rootBudget), period)
-		_ = writeRtPair(kubepods, rtPairsList(kubepodsBudget), period)
-		_ = writeRtPair(besteffort, rtPairsList(besteffortBudget), period)
-		if list := rtPairsList(podBudget); list != "" {
-			_ = writeRtPair(pod, list, period)
+			// Also seed the cgroup-v2 ROOT so runc alone can establish the whole
+			// chain. The root RT file is only writable while global RT admission
+			// control is OFF (kernel.sched_rt_runtime_us = -1); under a finite
+			// global it returns EBUSY and this write is silently skipped
+			// (best-effort) - which is fine, as the root then draws its budget
+			// directly from the global sysctl. preserveFloor keeps any node cap.
+			top := chain[len(chain)-1]
+			rootBudget := childrenSum(UnifiedMountpoint, top, budgets[len(chain)-1], true)
+
+			// Write top down so Sum(children) <= parent holds at every step. Best
+			// effort: a capped/pre-seeded/unwritable parent never blocks container
+			// creation - only the leaf write below is authoritative.
+			_ = writeRtPair(UnifiedMountpoint, rtPairsList(rootBudget), period)
+			for i := len(chain) - 1; i >= 0; i-- {
+				if list := rtPairsList(budgets[i]); list != "" {
+					_ = writeRtPair(chain[i], list, period)
+				}
+			}
 		}
 	}
 
@@ -344,6 +366,23 @@ func rtRuntimeIsZero(dir string) bool {
 		return false
 	}
 	return strings.TrimSpace(data) == "0"
+}
+
+// globalRtPeriod returns the node-wide RT period (kernel.sched_rt_period_us).
+// It is used as the default cgroup rt_period when the OCI spec sets
+// realtimeRuntime but omits realtimePeriod, so the leaf and the ancestors we
+// seed all share the single period the kernel requires. Returns 0 if it cannot
+// be read or parsed.
+func globalRtPeriod() uint64 {
+	data, err := os.ReadFile("/proc/sys/kernel/sched_rt_period_us")
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // writeRtPair writes cpu.rt_period_us and cpu.rt_runtime_us to dir. Order
