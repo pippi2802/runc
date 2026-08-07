@@ -143,16 +143,31 @@ func setRtSched(dirPath string, r *configs.Resources) error {
 			// reservations (with this pod substituted in), not seeded
 			// all-or-nothing.
 			//
-			// Every ancestor keeps its existing per-core values as a FLOOR
-			// (preserveFloor=true), so the pre-provisioned node RT cap seeded once
-			// at boot on kubepods.slice is never lowered or zeroed, and two pods
-			// starting concurrently on disjoint cores never wipe each other's
-			// budget (each would otherwise rewrite a shared QoS slice with only
-			// its own cores). Preserving the floor keeps all cores funded.
+			// Only the OUTERMOST ancestor (kubepods.slice, chain[len(chain)-1])
+			// keeps its existing per-core values as a FLOOR (preserveFloor=true):
+			// that is the level rt-budget-seed.sh actually pre-provisions at boot,
+			// and its cap must never be lowered or zeroed by a per-pod recompute.
+			// Every INTERMEDIATE level (the QoS slice) is recomputed with NO floor,
+			// purely from its real current children -- this is what makes a
+			// deleted pod's contribution actually disappear instead of being kept
+			// forever as a stale floor (found 2026-08-07: with an unconditional
+			// floor, kubepods-besteffort.slice's cpu.rt_runtime_us only ever grew,
+			// even after every pod that contributed to it was long deleted, until
+			// unrelated high-utilization cells failed admission against a ceiling
+			// that no longer reflected any real running pod).
+			//
+			// Trade-off: without a floor at the QoS level, two pods created
+			// concurrently on disjoint cores could transiently undercount each
+			// other if one's childrenSum scan runs before the other's write lands
+			// -- self-correcting (every container creation re-runs this same
+			// recompute, so the other pod's own write follows moments later) and
+			// already within the retry envelope the harness's own placement
+			// verification (confirm_burning_cpu, etc.) is built to catch, unlike
+			// the permanent, non-self-healing leak this replaces.
 			budgets := make([]map[int]int64, len(chain))
 			budgets[0] = podSliceBudget(chain[0], dirPath, leafRt)
 			for i := 1; i < len(chain); i++ {
-				budgets[i] = childrenSum(chain[i], chain[i-1], budgets[i-1], true)
+				budgets[i] = childrenSum(chain[i], chain[i-1], budgets[i-1], i == len(chain)-1)
 			}
 
 			// Also seed the cgroup-v2 ROOT so runc alone can establish the whole
